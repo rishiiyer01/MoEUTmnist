@@ -77,76 +77,155 @@ class RotaryPositionEmbedding(nn.Module):
         # (a + ib)(cos θ + i sin θ) = (a cos θ - b sin θ) + i(a sin θ + b cos θ)
         return (x * cos) + (self._rotate_half(x) * sin)
 
-class ffMoE(nn.Module):
-  def __init__(self, num_experts, hidden_size, ffn_hidden_size,k=1):
-    super().__init__()
 
+#only difference between ffMoE and koMoE is that the router routes to linear layers rather than mlps
+class koMoE(nn.Module):
+    def __init__(self, num_experts, hidden_size,k=2):
+        super().__init__()
     
-    self.k=k
-    self.num_experts = num_experts
-    self.router = nn.Linear(hidden_size, num_experts)
-    
-    self.world_size=torch.distributed.get_world_size()
-    if self.world_size==1:
-        self.experts = nn.ModuleList([MLP(hidden_size, ffn_hidden_size) for _ in range(num_experts)])
-    else: #expert parallel
-        experts_per_rank = num_experts // self.world_size
-        assert num_experts % self.world_size == 0, "Number of experts must be divisible by world size"
-        start_idx = self.rank * experts_per_rank
-        end_idx = start_idx + experts_per_rank
-        self.local_experts_ids = list(range(start_idx, end_idx))
+        self.rank=torch.distributed.get_rank()
+        self.k=k
+        self.num_experts = num_experts
+        self.router = nn.Linear(hidden_size, num_experts)
         
-    self.local_experts = nn.ModuleList([MLP(hidden_size, ffn_hidden_size) for _ in range(experts_per_rank)])
+        self.world_size=torch.distributed.get_world_size()
+        if self.world_size==1:
+            self.experts = nn.ModuleList([nn.Linear(hidden_size,hidden_size) for _ in range(num_experts)])
+        else: #expert parallel
+            experts_per_rank = num_experts // self.world_size
+            assert num_experts % self.world_size == 0, "Number of experts must be divisible by world size"
+            start_idx = self.rank * experts_per_rank
+            end_idx = start_idx + experts_per_rank
+            self.local_experts_ids = list(range(start_idx, end_idx))
+            
+        self.local_experts = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(experts_per_rank)])
 
-  def forward(self, x):
-    # x: (B, S, H)
-    if self.world_size==1:
-        B,S,H=x.shape
-        scores = self.router(x) # (B, S, E)
-        probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
-        p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
-        p=p.unsqueeze(-1) #B,S,K,1
-        out=torch.zeros((B,S,self.k,H))
+    def forward(self, x):
+        # x: (B, S, H)
+        if self.world_size==1:
+            B,S,H=x.shape
+            scores = self.router(x) # (B, S, E)
+            probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
+            p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
+            p=p.unsqueeze(-1) #B,S,K,1
+            out=torch.zeros((B,S,self.k,H))
         
         
-        for i, expert in enumerate(self.experts):
-          #mask=(expert_id==i) #3 dimensional slice (B,S,k)
-          B,S,K=torch.where(expert_id==i)
-          #print(x[B,S,:].shape)
-          
-          out[B,S,K,:]=expert(x[B,S,:])
-          #print(out.shape,p.shape)
-        p=p/p.sum(dim=2)
-        output=(p*out).sum(dim=2)
-    else:
+            for i, expert in enumerate(self.experts):
+              #mask=(expert_id==i) #3 dimensional slice (B,S,k)
+              B,S,K=torch.where(expert_id==i)
+              #print(x[B,S,:].shape)
+              
+              out[B,S,K,:]=expert(x[B,S,:])
+              #print(out.shape,p.shape)
+            p=p/p.sum(dim=2)
+            output=(p*out).sum(dim=2)
+        else:
         
-        device=torch.cuda.current_device()
-        b,s,h=x.shape
-        scores = self.router(x) # (B, S, E)
-        probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
-        p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
-        p=p.unsqueeze(-1) #B,S,K,1
-        out=torch.empty((b,s,self.k,h))
-        global_out=torch.empty((self.world_size*b,s,self.k,h),device=device) # each gpu will have it's data parallel we need to grab
-        global_expert_id=torch.empty((self.world_size*b,s,self.k),device=device)
-        torch.distributed.all_gather(global_expert_id,expert_id) 
-        global_x=torch.empty((self.world_size*b,s,h),device=device) #gathers x from dp
-        torch.distributed.all_gather(global_x,x)
-        output_total = torch.zeros((b,s,self.k,h))
+            device=torch.cuda.current_device()
+            b,s,h=x.shape
+            scores = self.router(x) # (B, S, E)
+            probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
+            p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
+            p=p.unsqueeze(-1) #B,S,K,1
+            out=torch.empty((b,s,self.k,h))
+            global_out=torch.empty((self.world_size*b,s,self.k,h),device=device,dtype=x.dtype) # each gpu will have it's data parallel we need to grab
+            global_expert_id=torch.empty((self.world_size*b,s,self.k),device=device,dtype=expert_id.dtype)
+            torch.distributed.all_gather_into_tensor(global_expert_id,expert_id) 
+            global_x=torch.empty((self.world_size*b,s,h),device=device,dtype=x.dtype) #gathers x from dp
+            torch.distributed.all_gather_into_tensor(global_x,x)
+            output_total = torch.zeros((self.world_size*b,s,self.k,h),dtype=x.dtype,device=device)
             for i, expert in enumerate(self.local_experts):
-                local_expert_id = self.local_experts_ids[i]
+                local_expert_id = self.local_experts_ids[i] #1,2,3,4 | 5,6,7,8 for default case
                 B, S, K = torch.where(global_expert_id == local_expert_id)
                 out = expert(global_x[B, S, :])
-                output_total[B, S, K,:] = out
-            output_local = torch.empty((b, s, h), device=device)
-            torch.distributed.scatter(output_local, output_total)
-        p=p/p.sum(dim=2)
-        output=(p*out).sum(dim=2)
-    return output
+                output_total[B, S, K,:] = out #should only store the first 4 k slices on the zeroth gpu
+                
+            output_local = torch.empty((b, s,self.k, h), device=device,dtype=output_total.dtype)
+            #output_local_list=[torch.empty((b,s,h)) for _ in range(self.world_size)]
+            #output_total_list=list(torch.tensor_split(output_total,self.world_size,dim=0))
+            torch.distributed.reduce_scatter_tensor(output_local, output_total) 
+            p=p/(p.sum(dim=2).unsqueeze(2))
+            output=(p*output_local).sum(dim=2)
+            
+            
+        return output
+
+    
+class ffMoE(nn.Module):
+    def __init__(self, num_experts, hidden_size,k=2):
+        super().__init__()
+    
+        
+        self.k=k
+        self.num_experts = num_experts
+        self.router = nn.Linear(hidden_size, num_experts)
+        
+        self.world_size=torch.distributed.get_world_size()
+        self.rank=torch.distributed.get_rank()
+        if self.world_size==1:
+            self.experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(num_experts)])
+        else: #expert parallel
+            experts_per_rank = num_experts // self.world_size
+            assert num_experts % self.world_size == 0, "Number of experts must be divisible by world size"
+            start_idx = self.rank * experts_per_rank
+            end_idx = start_idx + experts_per_rank
+            self.local_experts_ids = list(range(start_idx, end_idx))
+            
+        self.local_experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(experts_per_rank)])
+
+    def forward(self, x):
+        # x: (B, S, H)
+        if self.world_size==1:
+            B,S,H=x.shape
+            scores = self.router(x) # (B, S, E)
+            probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
+            p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
+            p=p.unsqueeze(-1) #B,S,K,1
+            out=torch.zeros((B,S,self.k,H))
+        
+        
+            for i, expert in enumerate(self.experts):
+              #mask=(expert_id==i) #3 dimensional slice (B,S,k)
+              B,S,K=torch.where(expert_id==i)
+              #print(x[B,S,:].shape)
+              
+              out[B,S,K,:]=expert(x[B,S,:])
+              #print(out.shape,p.shape)
+            p=p/p.sum(dim=2)
+            output=(p*out).sum(dim=2)
+        else:
+        
+            device=torch.cuda.current_device()
+            b,s,h=x.shape
+            scores = self.router(x) # (B, S, E)
+            probs_0 = F.softmax(scores,dim=-1) # (B, S, E)
+            p,expert_id=torch.topk(probs_0,self.k,dim=-1) #(B,S,K)
+            p=p.unsqueeze(-1) #B,S,K,1
+            out=torch.empty((b,s,self.k,h))
+            global_out=torch.empty((self.world_size*b,s,self.k,h),device=device,dtype=x.dtype) # each gpu will have it's data parallel we need to grab
+            global_expert_id=torch.empty((self.world_size*b,s,self.k),device=device,dtype=expert_id.dtype)
+            torch.distributed.all_gather_into_tensor(global_expert_id,expert_id) 
+            global_x=torch.empty((self.world_size*b,s,h),device=device,dtype=x.dtype) #gathers x from dp
+            torch.distributed.all_gather_into_tensor(global_x,x)
+            output_total = torch.zeros((self.world_size*b,s,self.k,h),dtype=x.dtype,device=device)
+            for i, expert in enumerate(self.local_experts):
+                local_expert_id = self.local_experts_ids[i] #1,2,3,4 | 5,6,7,8 for default case
+                B, S, K = torch.where(global_expert_id == local_expert_id)
+                out = expert(global_x[B, S, :])
+                output_total[B, S, K,:] = out #should only store the first 4 k slices on the zeroth gpu
+                
+            output_local = torch.empty((b, s,self.k, h), device=device,dtype=output_total.dtype)
+            #output_local_list=[torch.empty((b,s,h)) for _ in range(self.world_size)]
+            #output_total_list=list(torch.tensor_split(output_total,self.world_size,dim=0))
+            torch.distributed.reduce_scatter_tensor(output_local, output_total) 
+            p=p/(p.sum(dim=2).unsqueeze(2))
+            output=(p*output_local).sum(dim=2)
+        return output
 
 
 class MnistModel(nn.Module):
-    def __init__(self, in_channels, hidden_dim, num_blocks,vocab=64000):
+    def __init__(self, in_channels, hidden_dim, num_blocks,vocab=256):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_blocks = num_blocks
@@ -166,10 +245,11 @@ class MnistModel(nn.Module):
         
      
     def forward(self, x,condition):
-        
+        condition=condition.to(torch.bfloat16)
         b,c,h,w=x.shape
            
         x=x.permute(0,2,3,1) #b,x,y,c
+        
         x=x.reshape(b,h*w,c) 
         x = self.initial_proj(x)
         
@@ -191,8 +271,8 @@ class MnistModel(nn.Module):
 class Block(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.attention =Attention(hidden_dim,num_heads=16)
-        self.ff = FeedForward(hidden_dim)
+        self.attention =SHAttention(8,hidden_dim,num_heads=16)
+        self.ff = ffMoE(8,hidden_dim) #num experts, hidden_size
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         
@@ -218,25 +298,30 @@ class FeedForward(nn.Module):
 
 
 
-class Attention(nn.Module):
-    def __init__(self, hidden_dim, num_heads=16):
+class SHAttention(nn.Module):
+    def __init__(self,num_experts, hidden_dim, num_heads=16):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         
         self.q_proj = nn.Linear(hidden_dim, hidden_dim )
         self.k_proj=nn.Linear(hidden_dim,hidden_dim)
-        self.v_proj=nn.Linear(hidden_dim,hidden_dim)
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        #self.v_proj=nn.Linear(hidden_dim,hidden_dim)
+        self.v_proj=koMoE(num_experts,hidden_dim)
+        #self.proj = nn.Linear(hidden_dim, hidden_dim)
+        self.proj=koMoE(num_experts,hidden_dim)
         self.rope=RotaryPositionEmbedding(self.head_dim)
         self.scale = self.head_dim ** -0.5
         
     def forward(self, x):
         B, N,dim = x.shape
-        x=x.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
+        #x=x.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3) #why did i split before projections
         q=self.q_proj(x)
-        k=self.k_proj(x)
+        q=q.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
+        k=self.k_proj(x) #B,N,dim
+        k=k.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         v=self.v_proj(x)
+        v=v.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         #print(q.shape)
         q=q+self.rope(q)
         k=k+self.rope(k)
