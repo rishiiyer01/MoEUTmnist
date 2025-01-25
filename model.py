@@ -189,9 +189,12 @@ class MnistModel(nn.Module):
         self.initial_proj = nn.Linear(in_channels, hidden_dim)  
         
         
-        self.blocks = nn.ModuleList([
-            Block(hidden_dim) for _ in range(num_blocks)
-        ])
+        #self.blocks = nn.ModuleList([
+        #    Block(hidden_dim) for _ in range(num_blocks)
+        #])
+        block1, block2 = Block(hidden_dim), Block(hidden_dim)
+        self.blocks = nn.ModuleList([block1 if i % 2 == 0 else block2 
+                                       for i in range(num_blocks)]) #Univeral Transformer Parameter Sharing
         
         
         self.out_proj = nn.Linear(hidden_dim, vocab)  
@@ -330,3 +333,4 @@ class SHAttention(nn.Module):
         
         x = self.proj(x)
         return x
+
