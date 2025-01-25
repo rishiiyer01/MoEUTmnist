@@ -79,6 +79,7 @@ class RotaryPositionEmbedding(nn.Module):
 
 
 #only difference between ffMoE and koMoE is that the router routes to linear layers rather than mlps
+#I accidentally named this koMoE instead of voMoE, it only operates on the v proj and o proj of attention
 class koMoE(nn.Module):
     def __init__(self, num_experts, hidden_size,k=2):
         super().__init__()
@@ -97,8 +98,7 @@ class koMoE(nn.Module):
             start_idx = self.rank * experts_per_rank
             end_idx = start_idx + experts_per_rank
             self.local_experts_ids = list(range(start_idx, end_idx))
-            
-        self.local_experts = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(experts_per_rank)])
+            self.local_experts = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(experts_per_rank)])
 
     def forward(self, x):
         # x: (B, S, H)
@@ -171,8 +171,7 @@ class ffMoE(nn.Module):
             start_idx = self.rank * experts_per_rank
             end_idx = start_idx + experts_per_rank
             self.local_experts_ids = list(range(start_idx, end_idx))
-            
-        self.local_experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(experts_per_rank)])
+            self.local_experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(experts_per_rank)])
 
     def forward(self, x):
         # x: (B, S, H)
@@ -233,7 +232,7 @@ class MnistModel(nn.Module):
         # Initial processing
         self.initial_proj = nn.Linear(in_channels, hidden_dim)  
         
-        # Main processing blocks
+        
         self.blocks = nn.ModuleList([
             Block(hidden_dim) for _ in range(num_blocks)
         ])
@@ -264,6 +263,45 @@ class MnistModel(nn.Module):
         logits=self.out_proj(x)
         
         return logits #b,h*w,vocab
+
+
+    @torch.no_grad()
+    def generate(self, x=None, condition=1):
+        condition = condition.to(torch.bfloat16)
+        condition = condition.unsqueeze(-1).unsqueeze(-1)
+        condition = self.start_proj(condition) #b,1,hidden_dim
+        
+        if x is None:
+            x = condition #b,1,hidden_dim
+        else:
+            x = x.permute(0,2,3,1) #b,x,y,c
+            x = x.reshape(b,h*w,c) 
+            x = self.initial_proj(x)
+            x = torch.cat((condition,x[:,:-1,:]),dim=1)
+        
+        max_len = 784
+        generated = []
+        
+        for i in range(max_len):
+            for block in self.blocks:
+                x = block(x)
+            logits = self.out_proj(x[:,-1:,:]) # Get last token
+            
+            # Sample from logits
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, 1)
+            
+            
+            token_embed = self.initial_proj(next_token.to(torch.bfloat16))
+            x = torch.cat([x, token_embed], dim=1)
+            generated.append(next_token)
+        
+       
+        generated = torch.cat(generated, dim=1)
+        return generated.reshape(-1, 28, 28)
+            
+            
+        
 
 
 
