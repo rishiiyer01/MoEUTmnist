@@ -38,7 +38,7 @@ def get_mnist_loaders(batch_size):
             image = self.dataset[idx]['image']
             label=self.dataset[idx]['label']
             image=self.transform(image)
-            # Convert image to tensor and normalize to [0, 1]
+            
             image = torch.tensor(image, dtype=torch.float32) # B,C=1,28,28
             label = torch.tensor(label, dtype=torch.long)
             return image, label
@@ -76,7 +76,7 @@ def train_one_epoch(model, train_loader, optimizer, epoch, device):
         pixels=(data * 255).round().reshape(b, -1).long() #integers between 0 and 255
         logits=logits.reshape(-1,256)
         pixels=pixels.reshape(-1)
-        loss = F.cross_entropy(logits, pixels) 
+        loss = F.cross_entropy(logits, pixels,label_smoothing=0.05) 
         
         
         optimizer.zero_grad()
@@ -100,10 +100,10 @@ def main():
     
     # Hyperparameters
     batch_size = 32
-    num_epochs = 10
+    num_epochs = 50
     hidden_dim = 512
-    num_blocks = 6
-    learning_rate = 3e-4
+    num_blocks = 8
+    learning_rate = 1e-4
     
     train_loader, train_sampler = get_mnist_loaders(batch_size)
     
@@ -139,18 +139,26 @@ def main():
         
         if local_rank == 0:
             print(f"Epoch {epoch} average loss: {train_loss:.4f}")
-            
-            # Save checkpoint
-            if epoch % 5 == 0:
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict = model.state_dict()
-                    if local_rank == 0:
-                        torch.save({
+        if epoch % 5 == 0:
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = model.state_dict()
+                #there probably is a more elegant generalizable way to do this but I was getting bugs with object gather
+                if local_rank == 0:      
+                    torch.save({
                             'epoch': epoch,
-                            'model_state_dict': state_dict,
+                            'model_state_dict_rank': state_dict,
                             'optimizer_state_dict': optimizer.state_dict(),
-                        }, f'checkpoint_epoch_{epoch}.pt')
+                        }, f'checkpoint_{epoch}_rank_{local_rank}.pt')
+                else:
+                    torch.save({
+                            'epoch': epoch,
+                            'model_state_dict_rank': state_dict,
+                            'optimizer_state_dict': optimizer.state_dict(),
+                        }, f'checkpoint_{epoch}_rank_{local_rank}.pt')
+                    
+            
+            
     
     dist.destroy_process_group()
 

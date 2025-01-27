@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from math import inf
 import math
+from torch.distributions import Categorical
 
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 4096):
@@ -90,7 +91,7 @@ class koMoE(nn.Module):
         self.router = nn.Linear(hidden_size, num_experts)
         
         self.world_size=torch.distributed.get_world_size()
-        self.experts = nn.ModuleList([nn.Linear(hidden_size,hidden_size) for _ in range(num_experts)]) #deprecated feature
+        #self.experts = nn.ModuleList([nn.Linear(hidden_size,hidden_size) for _ in range(num_experts)]) #deprecated feature
         experts_per_rank = num_experts // self.world_size
         assert num_experts % self.world_size == 0, "Number of experts must be divisible by world size"
         start_idx = self.rank * experts_per_rank
@@ -140,7 +141,7 @@ class ffMoE(nn.Module):
         self.world_size=torch.distributed.get_world_size()
         self.rank=torch.distributed.get_rank()
         
-        self.experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(num_experts)]) #deprecated feature
+        #self.experts = nn.ModuleList([FeedForward(hidden_size) for _ in range(num_experts)]) #deprecated feature
         
         experts_per_rank = num_experts // self.world_size
         assert num_experts % self.world_size == 0, "Number of experts must be divisible by world size"
@@ -223,7 +224,14 @@ class MnistModel(nn.Module):
         
         return logits #b,h*w,vocab
 
+    def topK(self, logits, k, temperature=1.0):
+        zeros = logits.new_ones(logits.shape) * float('-inf')
+        values, indices = torch.topk(logits, k, dim=-1)
+        zeros.scatter_(-1, indices, values)
+        dist = Categorical(logits=zeros / temperature)
+        return dist.sample()
 
+        
     @torch.no_grad()
     def generate(self, x=None, condition=1):
         condition = condition.to(torch.bfloat16)
@@ -248,7 +256,8 @@ class MnistModel(nn.Module):
             
             # Sample from logits
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)
+            
+            next_token = self.topK(probs,k=10).unsqueeze(1)
             
             
             token_embed = self.initial_proj(next_token.to(torch.bfloat16))
@@ -268,7 +277,7 @@ class MnistModel(nn.Module):
 class Block(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
-        self.attention =SHAttention(8,hidden_dim,num_heads=16)
+        self.attention =SHAttention(8,hidden_dim,num_heads=8)
         self.ff = ffMoE(8,hidden_dim) #num experts, hidden_size
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
@@ -296,7 +305,7 @@ class FeedForward(nn.Module):
 
 
 class SHAttention(nn.Module):
-    def __init__(self,num_experts, hidden_dim, num_heads=16):
+    def __init__(self,num_experts, hidden_dim, num_heads=8):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
@@ -320,8 +329,8 @@ class SHAttention(nn.Module):
         v=self.v_proj(x)
         v=v.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         #print(q.shape)
-        q=q+self.rope(q)
-        k=k+self.rope(k)
+        q=self.rope(q)
+        k=self.rope(k)
         
         attn = (q @ k.transpose(-2, -1)) * self.scale
         
@@ -333,4 +342,3 @@ class SHAttention(nn.Module):
         
         x = self.proj(x)
         return x
-
