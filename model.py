@@ -181,7 +181,7 @@ class ffMoE(nn.Module):
 
 
 class MnistModel(nn.Module):
-    def __init__(self, in_channels, hidden_dim, num_blocks,vocab=256):
+    def __init__(self, in_channels, hidden_dim, num_blocks,vocab=2):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_blocks = num_blocks
@@ -224,7 +224,7 @@ class MnistModel(nn.Module):
         
         return logits #b,h*w,vocab
 
-    def topK(self, logits, k, temperature=1.0):
+    def topK(self, logits, k, temperature=0.5):
         zeros = logits.new_ones(logits.shape) * float('-inf')
         values, indices = torch.topk(logits, k, dim=-1)
         zeros.scatter_(-1, indices, values)
@@ -240,16 +240,22 @@ class MnistModel(nn.Module):
         
         if x is None:
             x = condition #b,1,hidden_dim
+            length=0
+            generated = []
         else:
-            x = x.permute(0,2,3,1) #b,x,y,c
-            x = x.reshape(b,h*w,c) 
+            #x = x.permute(0,2,3,1) #b,x,y,c
+            #x = x.reshape(1,h*w,c)
+            generated = [x]
             x = self.initial_proj(x)
             x = torch.cat((condition,x[:,:-1,:]),dim=1)
+            length=x.shape[1]
+            
+            
         
         max_len = 784
-        generated = []
         
-        for i in range(max_len):
+        
+        for i in range(length,max_len):
             for block in self.blocks:
                 x = block(x)
             logits = self.out_proj(x[:,-1:,:]) # Get last token
@@ -257,7 +263,7 @@ class MnistModel(nn.Module):
             # Sample from logits
             probs = F.softmax(logits, dim=-1)
             
-            next_token = self.topK(probs,k=10).unsqueeze(1)
+            next_token = self.topK(probs,k=1).unsqueeze(1)
             
             
             token_embed = self.initial_proj(next_token.to(torch.bfloat16))
